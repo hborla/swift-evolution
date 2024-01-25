@@ -37,9 +37,9 @@ This proposal generalizes `AsyncSequence` in two ways:
 
 ## Motivation
 
-`AsyncSequence` and `AsyncIteratorProtocol` were designed to be polymorphic over the `throws` effect and actor isolation. However, the current API design has serious limitations that impact expressivity in generic code, `Sendable` checking, and runtime performance.
+`AsyncSequence` and `AsyncIteratorProtocol` were intended to be polymorphic over the `throws` effect and actor isolation. However, the current API design has serious limitations that impact expressivity in generic code, `Sendable` checking, and runtime performance.
 
-Some `AsyncSequence`s can throw during iteration, and others never throw. To enable callers to only require `try` when the given sequence can throw, `AsyncSequence` and `AsyncIteratorProtocol` use a bespoke `@rethrows` attribute on the protocol. The `@rethrows` attribute does not allow generic constraints over the `throws` effect, which has also [prevented `AsyncSequence` from adopting primary associated types](https://forums.swift.org/t/se-0346-lightweight-same-type-requirements-for-primary-associated-types/55869/70). Primary associated types on `AsyncSequence` would enable hiding concrete implementation details behind constrained opaque or existential types, such as in transformation APIs on `AsyncSequence`:
+Some `AsyncSequence`s can throw during iteration, and others never throw. To enable callers to only require `try` when the given sequence can throw, `AsyncSequence` and `AsyncIteratorProtocol` used an experimental feature to try to capture the throwing behavior of a protocol. However, this approach was insufficiently general, which has also [prevented `AsyncSequence` from adopting primary associated types](https://forums.swift.org/t/se-0346-lightweight-same-type-requirements-for-primary-associated-types/55869/70). Primary associated types on `AsyncSequence` would enable hiding concrete implementation details behind constrained opaque or existential types, such as in transformation APIs on `AsyncSequence`:
 
 ```swift
 extension AsyncSequence {
@@ -50,7 +50,7 @@ extension AsyncSequence {
 }
 ```
 
-`AsyncSequence` types are designed to work with `Sendable` and non-`Sendable` element types, but it's currently impossible to use an `AsyncSequence` with non-`Sendable` elements in an actor-isolated context:
+Additionally, `AsyncSequence` types are designed to work with `Sendable` and non-`Sendable` element types, but it's currently impossible to use an `AsyncSequence` with non-`Sendable` elements in an actor-isolated context:
 
 ```swift
 class NotSendable { ... }
@@ -71,7 +71,7 @@ Finally, `next()` always running on the generic executor is the source of unnece
 
 ## Proposed solution
 
-This proposal replaces the `@rethrows` attribute on `AsyncSequence` and `AsyncIteratorProtocol` with a primary `Failure` associated type, adds a new protocol requirement to `AsyncIteratorProtocol` that generalizes the existing `next()` requirement by throwing the `Failure` type, and adds an `isolated` parameter to the new requirement to abstract over actor isolation:
+This proposal introduces a new associated type `Failure` to  `AsyncSequence` and `AsyncIteratorProtocol`, adopts both `Element` and `Failure` as primary associated types, adds a new protocol requirement to `AsyncIteratorProtocol` that generalizes the existing `next()` requirement by throwing the `Failure` type, and adds an `isolated` parameter to the new requirement to abstract over actor isolation:
 
 ```swift
 @available(SwiftStdlib 5.1, *)
@@ -221,27 +221,21 @@ Because the default implementation of `nextElement()` is deprecated, conformance
 
 When an `AsyncIteratorProtocol`-conforming type provides a `nextElement` function, the `Failure` type is inferred based on whether (and what) `nextElement` throws using the rules described in [SE-0413](/proposals/0413-typed-throws.md).
 
-If the `AsyncIteratorProtocol`-conforming type uses the default implementation of `nextElement`, then the `Failure` associated type is inferred from the `next` function instead based on the following rules:
-
-* If `next()` throws nothing, `Failure` is inferred to `Never`.
-* If `next()` throws, `Failure` is inferred to `any Error`.
-* If `next()` rethrows, `Failure` is inferred to `T.Failure`, where `T` is the first type parameter with a conformance to either `AsyncSequence` or `AsyncIteratorProtocol`. If there are multiple such requirements, take the `errorUnion` of them all.
-
-### `rethrows` checking
-
-Conformance requirements to `@rethrows` protocols can be considered as sources of errors for rethrowing. For example, the following `rethrows` function is valid:
-
-```swift
-extension AsyncSequence {
-  func contains(_ predicate: (Element) async throws -> Bool) rethrows -> Bool { ... }
-}
-```
-
-and this function can throw if either the `AsyncSequence` throws (i.e., it's `Failure` type is not `Never`) or if the predicate throws. To preserve source compatibility, this proposal introduces a specific rule that allows requirements on `AsyncSequence` and `AsyncIteratorProtocol` to be involved in `rethrows` checking.
+If the `AsyncIteratorProtocol`-conforming type uses the default implementation of `nextElement`, then the `Failure` associated type is inferred from the `next` function instead. Whatever type is thrown from the `next` function (including `Never` if it is non-throwing) is inferred as the `Failure` type.
 
 ## Source compatibility
 
-The new requirements to `AsyncSequence` and `AsyncIteratorProtocol` are additive with no source compatibility impact on existng code.
+The new requirements to `AsyncSequence` and `AsyncIteratorProtocol` are additive, with default implementations and `Failure` associated type inference heuristics that ensure that existing types that conform to these protocols will continue to work.
+
+The experimental "rethrowing conformances" feature used by `AsyncSequence` and `AsyncIteratorProtocol` presents some challenges for source compatibility. Namely, one can declare a `rethrows` function that considers conformance to these rethrowing protocols as sources of errors for rethrowing. For example, the following `rethrows` function is currently valid:
+
+```swift
+extension AsyncSequence {
+  func contains(_ value: Element) rethrows -> Bool where Element: Hashable { ... }
+}
+```
+
+With the removal of the experimental "rethrowing conformances" feature, this function becomes ill-formed because there is no closure argument that can throw. To preserve source compatibility for such functions, this proposal introduces a specific rule that allows requirements on `AsyncSequence` and `AsyncIteratorProtocol` to be involved in `rethrows` checking: a `rethrows` function is considered to be able to throw `T.Failure` for every `T: AsyncSequence` or `T: AsyncIteratorProtocol` conformance requirement. In the case of this `contains` operation, that means it can throw `Self.Failure`. The rule permitting the definition of these `rethrows` functions will only be permitted prior to Swift 6.
 
 ## ABI compatibility
 
