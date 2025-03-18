@@ -74,6 +74,15 @@ Closure body macros are declared in the same way that function body macros are, 
 @attached(body) macro AssumeMainActor() = #externalMacro(...)
 ```
 
+Attached macros with the `body` role can have no result type, or the result type can be a function type:
+
+```swift
+@attached(body)
+macro Task<each Input>() -> (repeat each Input) -> Void = #externalMacro(...)
+```
+
+If a `body` macro specifies a result type, it must match the type of the function or closure the macro is attached to. This function type is used for closure type inference as described in the [type checking closure body macros section](#type-checking-closure-body-macro-expansions).
+
 ### Implementing closure body macros
 
 This proposal adds the following requirement to the `BodyMacro` protocol:
@@ -105,11 +114,7 @@ Like other closure attributes, body macro attributes are written in the closure 
 }
 ```
 
-#### Type checking closure body macro attributes
-
-Function body macros on closures are different from other attached macros in local scope because they must be expanded before type checking, and they can be part of the same expression that introduces values used in the macro argument list.
-
-This poses a challenge for type checking closure body macro attributes; you may want to use values from the surrounding context as macro arguments, but the macro attribute must be expanded before those values are type checked. For example:
+Function body macros on closures are different from other attached macros in local scope because they can be part of the same expression that introduces values used in the macro argument list. This poses a challenge for type checking closure body macros; you may want to use values from the surrounding context as macro arguments, but those values may not have a fully resolved type at the time of macro resolution. For example:
 
 ```swift
 f(0) { z in
@@ -119,56 +124,28 @@ f(0) { z in
 }
 ```
 
-In the above example the `@Traced` body macro must expand the closure body before type checking the expression, and the type of `z` is not known until the the overload for `f` is fully resolved. Waiting to resolve `@Traced` until an overload for `f` is selected means that the `@Traced` macro would have the potential to be expanded multiple times for each potential type of `z`. Resolving `@Traced` during overload resolution also does not guarantee that the type of `z` will be known when resolving the macro, because both single and multi-statement closures support inferring closure parameter types from the closure body. For example:
+In the above example, and the type of `z` is not known until the the overload for `f` is fully resolved.
+
+Because macro argument types can influence macro resolution, closure body macro attributes are type checked together with the enclosing expression. However, closure body macro expansions are type checked separately. Like freestanding expression macros, the macro attribute can be resolved multiple times during overload resolution, but the macro is not expanded until after a final solution has been found. This allows closure body macro attributes to freely use values from the surrounding context without restrictions on their types, while still maintaining the property that body macros are only expanded once.
+
+#### Parameter and result type inference
+
+This approach requires preventing the body macro expansion from influencing type inference of parameter and result types of the closure. Inference of parameter types from closure bodies is rare in multi-statement closures, and restricting this inference does not sacrifice much expressivity for closure body macros; it's far more common for closure parameter types to be inferred from a corresponding parameter type when the closure is used as a function argument. However, closure return type inference from its body is extremely common.
+
+To allow the macro to still provide a concrete result type, the macro declaration is used as a source of type inference for the closure signature. If the macro declaration provides a result type, that function type is matched against the parameter and result types in the closure signature to allow concrete types from the macro declaration to be inferred on the closure that the macro is attached to. For example:
 
 ```swift
-struct G<T> {}
+@attached(body)
+macro InferTypes() -> (Int) -> String? = #externalMacro(...)
 
-func acceptClosure<T>(_: (G<T>) -> Void) {}
-
-func useInt(_: G<Int>) {}
-
-func test() {
-  acceptClosure { x in
-    print("hello")
-    useInt(x) // the type of 'T' is inferred as 'Int' here
+func useMacro() {
+  let f = { @InferTypes a, b in
+    return nil
   }
 }
 ```
 
-To solve these problems, closure body macros delay type checking attribute arguments. When resolving the macro attribute, all non-literal argument values will be made opaque, and concrete types are only used on the opaque argument values if they are explicitly written with `as`. Macro resolution must be able to disambiguate macro overloads from the following aspects of the macro arguments:
-
-* Literal argument values
-* Explicit argument types with written with `as`
-* Explicit generic arguments
-* Argument labels or the size of the argument list
-
-Resolving a macro attribute is allowed to have types that cannot be inferred due to opaque argument values, but macro resolution must be able to disambiguate macro overloads.
-
-For example, the following macro attribute is ambiguous:
-
-```swift
-@attached(body) macro MyMacro(_: Int) = #externalMacro(...)
-@attached(body) macro MyMacro(_: String) = #externalMacro(...)
-
-func acceptClosure(_: (Int) -> Void) {}
-
-func applyMacro() {
-  acceptClosure { x in
-    { @MyMacro(x) in // error
-      ...
-    }()
-  }
-}
-```
-
-Type checking a closure body macro proceeds as follows:
-
-1. Before type checking an expression, all closure body macros are resolved and expanded. This step is recursive, because body macro expansions may contain closures with other body macros attached.
-2. After the closure that the body macro is attached to has a resolved type (which may include not-yet-resolved types in structural positions), the macro arguments are type checked.
-3. After macro arguments are type checked, the expanded macro body is type checked.
-
-This approach preserves the property that body macros are expanded only once without sacrificing too much expressivity in macro attributes.
+In the above code example, the `InferMacro` result type `(Int, String) -> Void` is used to infer types in the closure signature of `f`. So, `a` is inferred as `Int`, and the return type is inferred to be `String?`. These types are inferred without expanding the `@InferTypes` macro.
 
 ## Source compatibility
 
@@ -238,6 +215,44 @@ func shadow(a: Int) {
 
 When resolving `@MyMacro(a)`, `a` would have type `Int`, but if `a` is used in the macro expansion, it would have type `String`.
 
+### Delay type checking of closure body macro arguments
+
+A previous iteration of this proposal delayed type checking arguments to closure body macro attributes.
+
+When resolving the macro attribute, all non-literal argument values can be made opaque, and concrete types are only used on the opaque argument values if they are explicitly written with `as`. Macro resolution must be able to disambiguate macro overloads from the following aspects of the macro arguments:
+
+* Literal argument values
+* Explicit argument types with written with `as`
+* Explicit generic arguments
+* Argument labels or the size of the argument list
+
+Resolving a macro attribute is allowed to have types that cannot be inferred due to opaque argument values, but macro resolution must be able to disambiguate macro overloads.
+
+For example, the following macro attribute is ambiguous:
+
+```swift
+@attached(body) macro MyMacro(_: Int) = #externalMacro(...)
+@attached(body) macro MyMacro(_: String) = #externalMacro(...)
+
+func acceptClosure(_: (Int) -> Void) {}
+
+func applyMacro() {
+  acceptClosure { x in
+    { @MyMacro(x) in // error
+      ...
+    }()
+  }
+}
+```
+
+Type checking a closure body macro proceeds as follows:
+
+1. Before type checking an expression, all closure body macros are resolved and expanded. This step is recursive, because body macro expansions may contain closures with other body macros attached.
+2. After the closure that the body macro is attached to has a resolved type (which may include not-yet-resolved types in structural positions), the macro arguments are type checked.
+3. After macro arguments are type checked, the expanded macro body is type checked.
+
+This approach preserves the property that body macros are expanded only once without sacrificing too much expressivity in macro attributes. However, it imposes really strange type inference limitations, and nothing else in the language uses a type inference strategy like this.
+
 ### Expanding closure body macros during overload resolution
 
 Another approach to the macro argument type checking problem is delaying resolving a closure body macro until the structure of the closure is known during overload resolution. This approach has the following tradeoffs:
@@ -247,6 +262,6 @@ Another approach to the macro argument type checking problem is delaying resolvi
 
 ## Acknowledgments
 
-Thank you to Pavel Yaskevich for helping debug issues in the implementation and brainstorming strategies to the argument type checking problem.
+Thank you to Pavel Yaskevich for helping debug issues in the implementation. Thank you to Pavel Yaskevich, Slava Pestov, and Anthony Latsis for helping me brainstorm better solutions to the macro argument type checking problem.
 
 [SE-0415]: /proposals/0415-function-body-macros.md
